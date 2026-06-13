@@ -46,15 +46,15 @@ android {
 chaquopy {
     defaultConfig {
         version = "3.11"
-        // pip {
-        //     install("yt-dlp")
-        //     install("requests")
-        //     install("google-api-python-client")
-        //     install("flask")
-        //     install("youtube-transcript-api")
-        //     install("aiohttp")
-        //     install("Flask-HTTPAuth")
-        // }
+        pip {
+            install("yt-dlp")
+            install("requests")
+            install("google-api-python-client")
+            install("flask")
+            install("youtube-transcript-api")
+            install("aiohttp")
+            install("Flask-HTTPAuth")
+        }
     }
 }
 
