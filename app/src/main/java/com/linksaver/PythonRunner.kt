@@ -33,6 +33,8 @@ interface PythonLogger {
     fun log(msg: String)
 }
 
+data class PipPackage(val displayName: String, val rawFolderName: String, val isSdist: Boolean)
+
 object PythonRunner {
 
     fun executeSingleScript(context: Context, fileName: String): Boolean {
@@ -95,25 +97,46 @@ object PythonRunner {
         mainModule.put("android_logger", loggerObj)
 
         val mainGlobals = mainModule.get("__dict__")
+        
+        // This upgraded setupCode fixes namespace packages (like 'google') and nested .tar.gz source distributions
         val setupCode = """
-import sys
+import sys, os, site
+
 site_pkgs = "${sitePackages.absolutePath}"
-if site_pkgs not in sys.path:
-    sys.path.insert(0, site_pkgs)
+if os.path.exists(site_pkgs):
+    # Process .pth files and namespace packages properly (Fixes 'google' namespace issues)
+    site.addsitedir(site_pkgs)
+    
+    # Auto-detect extracted source distributions (.tar.gz) which nest their contents
+    for item in os.listdir(site_pkgs):
+        item_path = os.path.join(site_pkgs, item)
+        if os.path.isdir(item_path):
+            if item.endswith(".dist-info") or item.endswith(".egg-info") or item == "__pycache__":
+                continue
+            
+            # If it's an extracted source distribution (e.g., google-3.0.0 has a setup.py or pyproject.toml)
+            if os.path.exists(os.path.join(item_path, "setup.py")) or os.path.exists(os.path.join(item_path, "pyproject.toml")):
+                src_path = os.path.join(item_path, "src")
+                if os.path.isdir(src_path):
+                    site.addsitedir(src_path)
+                else:
+                    site.addsitedir(item_path)
+
+    # Reorder sys.path so our custom packages have the highest priority
+    # This prevents older built-ins from shadowing the fresh pip installs
+    custom_paths = [p for p in sys.path if p.startswith(site_pkgs)]
+    default_paths = [p for p in sys.path if not p.startswith(site_pkgs)]
+    sys.path = custom_paths + default_paths
 
 class AndroidWriter:
     def __init__(self, logger):
         self.logger = logger
     def write(self, msg):
-        if not msg:
-            return
-        if isinstance(msg, bytes):
-            msg = msg.decode('utf-8', errors='replace')
+        if not msg: return
+        if isinstance(msg, bytes): msg = msg.decode('utf-8', errors='replace')
         text = msg.strip()
-        if text:
-            self.logger.log(text)
-    def flush(self):
-        pass
+        if text: self.logger.log(text)
+    def flush(self): pass
 
 sys.stdout = AndroidWriter(android_logger)
 sys.stderr = AndroidWriter(android_logger)
@@ -156,6 +179,23 @@ sys.stderr = AndroidWriter(android_logger)
         val installerCode = """
 import urllib.request, json, zipfile, tarfile, os, re
 
+def normalize_name(name):
+    return re.sub(r'[-_.]+', '_', name).lower()
+
+def is_installed(pkg, target):
+    norm_pkg = normalize_name(pkg)
+    # Check standard module folder
+    if os.path.exists(os.path.join(target, norm_pkg)):
+        return True
+    # Check dist-info/egg-info metadata folders
+    if os.path.exists(target):
+        for item in os.listdir(target):
+            if item.endswith(".dist-info") or item.endswith(".egg-info"):
+                prefix = normalize_name(item.split("-")[0])
+                if prefix == norm_pkg:
+                    return True
+    return False
+
 def find_local_package(pkg, modules_dir):
     base_name_wheel = pkg.replace('-', '_').lower()
     base_name_tar = pkg.lower()
@@ -174,9 +214,14 @@ def find_local_package(pkg, modules_dir):
 
 def install_package(pkg, target_site_packages, modules_dir, log, visited=None):
     if visited is None: visited = set()
-    pkg_clean = pkg.lower().replace("-", "_")
+    pkg_clean = normalize_name(pkg)
     if pkg_clean in visited: return True
     visited.add(pkg_clean)
+    
+    # Corrected check: prevents endless loops downloading dependencies with alternate import names
+    if is_installed(pkg, target_site_packages):
+        log.log(f"[INFO] {pkg} is already installed. Skipping.")
+        return True
     
     local_path = find_local_package(pkg, modules_dir)
     requires = []
@@ -240,9 +285,9 @@ def install_package(pkg, target_site_packages, modules_dir, log, visited=None):
         return False
 
     if not requires:
-        base_name_search = pkg.replace('-', '_').lower()
+        base_name_search = pkg_clean
         for d in os.listdir(target_site_packages):
-            if d.lower().startswith(base_name_search) and d.endswith('.dist-info'):
+            if normalize_name(d).startswith(base_name_search) and (d.endswith('.dist-info') or d.endswith('.egg-info')):
                 meta_path = os.path.join(target_site_packages, d, 'METADATA')
                 if os.path.exists(meta_path):
                     with open(meta_path, 'r', encoding='utf-8') as f:
@@ -260,8 +305,7 @@ def install_package(pkg, target_site_packages, modules_dir, log, visited=None):
         match = re.match(r"^([a-zA-Z0-9\-_]+)", r_str.strip())
         if match:
             dep = match.group(1)
-            dep_dir = os.path.join(target_site_packages, dep.lower().replace("-", "_"))
-            if not os.path.exists(dep_dir):
+            if not is_installed(dep, target_site_packages):
                 install_package(dep, target_site_packages, modules_dir, log, visited)
                 
     return True
@@ -277,17 +321,38 @@ install_success = install_package("${packageName}", "${sitePackages.absolutePath
         }
     }
 
-    fun uninstallPipPackage(context: Context, packageFolder: String): Boolean {
+    fun uninstallPipPackage(context: Context, pkg: PipPackage): Boolean {
         return try {
             val sitePackages = File(context.filesDir, "site-packages")
-            val distInfoDir = File(sitePackages, packageFolder)
-            if (!distInfoDir.exists()) return false
-
-            val namePart = packageFolder.substringBefore("-").lowercase().replace("-", "_")
-            val mainDir = File(sitePackages, namePart)
-            if (mainDir.exists()) mainDir.deleteRecursively()
             
-            distInfoDir.deleteRecursively()
+            if (pkg.isSdist) {
+                // Delete the tarball extracted root folder directly
+                File(sitePackages, pkg.rawFolderName).deleteRecursively()
+            } else {
+                // Safely delete components of a compiled wheel
+                val distInfoDir = File(sitePackages, pkg.rawFolderName)
+                val recordFile = File(distInfoDir, "RECORD")
+                
+                if (recordFile.exists()) {
+                    // Precision uninstall: only delete files this package actually owns.
+                    // This prevents destroying shared namespaces like the `google/` folder!
+                    recordFile.forEachLine { line ->
+                        val filePath = line.substringBefore(",")
+                        val target = File(sitePackages, filePath)
+                        if (target.exists() && target.isFile) {
+                            target.delete()
+                        }
+                    }
+                } else {
+                    // Fallback to naive deletion if RECORD is missing
+                    val namePart = pkg.displayName.substringBefore("-").lowercase().replace("-", "_")
+                    val moduleDir = File(sitePackages, namePart)
+                    if (moduleDir.exists()) moduleDir.deleteRecursively()
+                }
+                
+                // Finally, delete the metadata folder
+                distInfoDir.deleteRecursively()
+            }
             true
         } catch (e: Exception) {
             e.printStackTrace()
@@ -295,12 +360,23 @@ install_success = install_package("${packageName}", "${sitePackages.absolutePath
         }
     }
 
-    fun getInstalledPackages(context: Context): List<String> {
+    fun getInstalledPackages(context: Context): List<PipPackage> {
         val sitePackages = File(context.filesDir, "site-packages")
         if (!sitePackages.exists() || !sitePackages.isDirectory) return emptyList()
-        return sitePackages.listFiles { file -> file.name.endsWith(".dist-info") || file.name.endsWith(".egg-info") }
-            ?.map { it.name.substringBefore(".dist-info").substringBefore(".egg-info") }
-            ?.sorted() ?: emptyList()
+        
+        val packages = mutableListOf<PipPackage>()
+        sitePackages.listFiles()?.forEach { file ->
+            if (file.isDirectory) {
+                if (file.name.endsWith(".dist-info") || file.name.endsWith(".egg-info")) {
+                    val display = file.name.substringBefore(".dist-info").substringBefore(".egg-info")
+                    packages.add(PipPackage(display, file.name, false))
+                } else if (File(file, "setup.py").exists() || File(file, "pyproject.toml").exists()) {
+                    // It's an extracted source distribution tarball (supports old setup.py and modern pyproject.toml)
+                    packages.add(PipPackage(file.name, file.name, true))
+                }
+            }
+        }
+        return packages.sortedBy { it.displayName }
     }
 
     private fun parseCronField(field: String, min: Int, max: Int): Set<Int> {

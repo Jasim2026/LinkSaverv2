@@ -292,7 +292,7 @@ fun PipPackageManagerDialog(scriptPath: String, onDismiss: () -> Unit) {
     var packageName by remember { mutableStateOf("") }
     var isInstalling by remember { mutableStateOf(false) }
     val logs = remember { mutableStateListOf<String>() }
-    var installedPackages by remember { mutableStateOf(emptyList<String>()) }
+    var installedPackages by remember { mutableStateOf(emptyList<PipPackage>()) }
     var refreshTrigger by remember { mutableStateOf(0) }
 
     LaunchedEffect(refreshTrigger) {
@@ -373,12 +373,15 @@ fun PipPackageManagerDialog(scriptPath: String, onDismiss: () -> Unit) {
                                 modifier = Modifier.padding(8.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Text(pkg, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                                Text(pkg.displayName, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
                                 IconButton(
                                     onClick = {
-                                        if (PythonRunner.uninstallPipPackage(context, pkg)) {
-                                            Toast.makeText(context, "Uninstalled $pkg", Toast.LENGTH_SHORT).show()
+                                        val success = PythonRunner.uninstallPipPackage(context, pkg)
+                                        if (success) {
+                                            Toast.makeText(context, "Successfully uninstalled ${pkg.displayName}", Toast.LENGTH_SHORT).show()
                                             refreshTrigger++
+                                        } else {
+                                            Toast.makeText(context, "Failed to uninstall ${pkg.displayName}", Toast.LENGTH_SHORT).show()
                                         }
                                     },
                                     enabled = !isInstalling
